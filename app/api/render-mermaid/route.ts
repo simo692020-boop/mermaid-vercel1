@@ -1,8 +1,6 @@
 
 // app/api/render-mermaid/route.ts
-// ✅ يعمل محليًا (puppeteer) وعلى Vercel (puppeteer-core + @sparticuz/chromium)
-// ✅ runtime NodeJS (Puppeteer لا يعمل على Edge)
-// ✅ يرسم Mermaid داخل صفحة HTML ثم يأخذ Screenshot مضبوط بالحجم
+// ✅ يعمل محليًا وعلى Vercel بدون أخطاء بناء
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -14,18 +12,18 @@ let puppeteer: any;
 let chromium: any;
 
 if (isVercel) {
-  // على Vercel نستخدم chromium الخفيف + puppeteer-core
+  // على Vercel: puppeteer-core + @sparticuz/chromium
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   puppeteer = require('puppeteer-core');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   chromium = require('@sparticuz/chromium');
 } else {
-  // محليًا نستخدم puppeteer الكامل الذي يحمّل Chromium تلقائيًا
+  // محليًا: puppeteer الكامل
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   puppeteer = require('puppeteer');
 }
 
-// صفحة HTML بسيطة نحقن فيها الـ SVG الناتج
+// HTML أساسي نحقن فيه الناتج لاحقًا
 function baseHtml(background = 'transparent', padding = 16) {
   return `<!doctype html>
 <html>
@@ -39,7 +37,7 @@ function baseHtml(background = 'transparent', padding = 16) {
 <body>
   <div id="wrap"></div>
   <script>
-    // بعض مكتبات تعتمد على process.env
+    // بعض المكتبات تعتمد على وجود process.env
     window.process = { env: { NODE_ENV: 'production' } };
   </script>
 </body>
@@ -47,28 +45,28 @@ function baseHtml(background = 'transparent', padding = 16) {
 }
 
 export async function POST(req: Request) {
+  let browser: any;
   try {
     const contentType = req.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       return NextResponse.json({ error: 'Content-Type must be application/json' }, { status: 400 });
     }
 
-    const payload = await req.json();
+    const body = await req.json();
     const {
       code,
       theme = 'default',
-      background = 'transparent', // 'transparent' أو لون مثل '#ffffff'
-      scale = 2,                  // يكبّر الدقة (1–3 عادةً)
+      background = 'transparent',
+      scale = 2,
       padding = 16,
       fontFamily = 'Inter, Arial, sans-serif'
-    } = payload || {};
+    } = body || {};
 
     if (!code || typeof code !== 'string') {
       return NextResponse.json({ error: 'Missing "code" (Mermaid DSL string)' }, { status: 400 });
     }
 
-    // تشغيل المتصفح
-    let browser: any;
+    // تشغيل المتصفح حسب البيئة
     if (isVercel) {
       const executablePath = await chromium.executablePath();
       browser = await puppeteer.launch({
@@ -87,80 +85,73 @@ export async function POST(req: Request) {
     const page = await browser.newPage();
     page.setDefaultTimeout(30000);
 
-    // حمّل الـ HTML الأساسي
+    // تحميل HTML
     const html = baseHtml(background, padding);
     await page.setContent(html, { waitUntil: ['domcontentloaded', 'networkidle0'] });
 
-    // أضف سكربت Mermaid من CDN
+    // تحميل Mermaid من CDN داخل الصفحة
     await page.addScriptTag({
       url: 'https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js'
     });
 
-    // ارسم الـ SVG داخل #wrap بشكل مباشر باستخدام mermaid.render
-    const rect = await page.evaluate(
-      async ({ code, theme, fontFamily }) => {
-        const mermaid = (window as any).mermaid;
-        // تهيئة Mermaid
-        mermaid.initialize({
-          startOnLoad: false,
-          theme,
-          securityLevel: 'strict',
-          fontFamily
-        });
+    // ارسم الـ SVG وأعد الأبعاد
+    const rect = await page.evaluate(async (params: any) => {
+      // @ts-ignore
+      const mermaid = window.mermaid;
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: params.theme,
+        securityLevel: 'strict',
+        fontFamily: params.fontFamily
+      });
 
-        // توليد SVG من الكود
-        const { svg } = await mermaid.render('graph-' + Date.now(), code);
+      const { svg } = await mermaid.render('graph-' + Date.now(), params.code);
 
-        // وضع الـ SVG داخل الصفحة
-        const wrap = document.getElementById('wrap')!;
-        wrap.innerHTML = svg;
+      const wrap = document.getElementById('wrap')!;
+      wrap.innerHTML = svg;
 
-        // ضبط خط الرسم
-        const svgEl = wrap.querySelector('svg') as SVGElement | null;
-        if (svgEl) {
-          (svgEl.style as any).fontFamily = fontFamily;
-        }
+      const svgEl = wrap.querySelector('svg') as SVGElement | null;
+      if (svgEl) {
+        (svgEl.style as any).fontFamily = params.fontFamily;
+      }
 
-        // محاولة استخراج الأبعاد بدقة
-        let width = 800;
-        let height = 400;
+      // حساب الأبعاد بدقة
+      let width = 800;
+      let height = 400;
 
-        if (svgEl) {
-          const viewBox = (svgEl as any).viewBox?.baseVal;
-          if (viewBox) {
-            width = Math.ceil(viewBox.width);
-            height = Math.ceil(viewBox.height);
-          } else {
-            // Fallback عبر getBBox (قد يفشل أحيانًا)
-            try {
-              // @ts-ignore
-              const bbox = (svgEl as any).getBBox?.();
-              if (bbox) {
-                width = Math.ceil(bbox.width);
-                height = Math.ceil(bbox.height);
-              } else {
-                const rect = svgEl.getBoundingClientRect();
-                if (rect?.width && rect?.height) {
-                  width = Math.ceil(rect.width);
-                  height = Math.ceil(rect.height);
-                }
+      if (svgEl) {
+        const vb = (svgEl as any).viewBox?.baseVal;
+        if (vb && vb.width && vb.height) {
+          width = Math.ceil(vb.width);
+          height = Math.ceil(vb.height);
+        } else {
+          try {
+            // @ts-ignore
+            const bbox = (svgEl as any).getBBox?.();
+            if (bbox && bbox.width && bbox.height) {
+              width = Math.ceil(bbox.width);
+              height = Math.ceil(bbox.height);
+            } else {
+              const r = svgEl.getBoundingClientRect();
+              if (r?.width && r?.height) {
+                width = Math.ceil(r.width);
+                height = Math.ceil(r.height);
               }
-            } catch (e) {
-              const rect = svgEl.getBoundingClientRect();
-              if (rect?.width && rect?.height) {
-                width = Math.ceil(rect.width);
-                height = Math.ceil(rect.height);
-              }
+            }
+          } catch {
+            const r = svgEl.getBoundingClientRect();
+            if (r?.width && r?.height) {
+              width = Math.ceil(r.width);
+              height = Math.ceil(r.height);
             }
           }
         }
+      }
 
-        return { width, height };
-      },
-      { code, theme, fontFamily }
-    );
+      return { width, height };
+    }, { code, theme, fontFamily });
 
-    // ضبط حجم الـ Viewport على حجم الرسم + الحواف
+    // ضبط الـ Viewport وتكبير الدقة عبر scale
     const width = (rect?.width || 800) + padding * 2;
     const height = (rect?.height || 400) + padding * 2;
 
@@ -170,7 +161,7 @@ export async function POST(req: Request) {
       deviceScaleFactor: Math.max(1, Number(scale) || 1)
     });
 
-    // Screenshot لعنصر التغليف
+    // Screenshot لعنصر #wrap فقط
     const container = await page.$('#wrap');
     if (!container) {
       await browser.close();
@@ -179,7 +170,7 @@ export async function POST(req: Request) {
 
     const buffer: Buffer = await container.screenshot({
       type: 'png',
-      omitBackground: background === 'transparent' // يجعل الخلفية شفافة إذا طلبت ذلك
+      omitBackground: background === 'transparent'
     });
 
     await browser.close();
@@ -194,15 +185,13 @@ export async function POST(req: Request) {
   } catch (err: any) {
     console.error('Mermaid render error:', err);
     try {
-      // لو المتصفح مفتوح، أغلقه بأمان
-      // @ts-ignore
-      if (typeof browser !== 'undefined' && browser) await browser.close();
+      if (browser) await browser.close();
     } catch {}
     return NextResponse.json({ error: String(err?.message || err) }, { status: 500 });
   }
 }
 
-// (اختياري) GET صحي للتأكد أن المسار شغّال
+// (اختياري) Endpoint للفحص السريع
 export async function GET() {
   return NextResponse.json({ ok: true, msg: 'Mermaid renderer is running (POST with {code})' });
 }
